@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
+	"net"
 	"net/netip"
 	"sort"
 	"strings"
@@ -69,10 +70,12 @@ func (i *arrayFlags) Set(value string) error {
 }
 
 var (
-	interval     = flag.Duration("interval", 10*time.Second, "How often to query for services")
-	output       = flag.String("out", "-", "Filename to write output to")
-	httpDomains  arrayFlags
-	httpsDomains arrayFlags
+	interval          = flag.Duration("interval", 10*time.Second, "How often to query for services")
+	output            = flag.String("out", "-", "Filename to write output to")
+	overrideHTTPPort  = flag.Uint("override-http-port", 0, "Override http port for discovered services")
+	overrideHTTPSPort = flag.Uint("override-https-port", 0, "Override http port for discovered services")
+	httpDomains       arrayFlags
+	httpsDomains      arrayFlags
 )
 
 func main() {
@@ -174,7 +177,7 @@ func (dd *Discovery) refreshAll(ctx context.Context, ch chan<- []*TargetGroup) {
 	wg.Add(len(httpDomains))
 	for _, name := range httpDomains {
 		go func(n string) {
-			if err := dd.refresh(ctx, n, false, targetChan); err != nil {
+			if err := dd.refresh(ctx, n, false, uint16(*overrideHTTPPort), targetChan); err != nil {
 				log.Printf("Error refreshing DNS targets: %s", err)
 			}
 			wg.Done()
@@ -184,7 +187,7 @@ func (dd *Discovery) refreshAll(ctx context.Context, ch chan<- []*TargetGroup) {
 	wg.Add(len(httpsDomains))
 	for _, name := range httpsDomains {
 		go func(n string) {
-			if err := dd.refresh(ctx, n, true, targetChan); err != nil {
+			if err := dd.refresh(ctx, n, true, uint16(*overrideHTTPSPort), targetChan); err != nil {
 				log.Printf("Error refreshing DNS targets: %s", err)
 			}
 			wg.Done()
@@ -196,7 +199,7 @@ func (dd *Discovery) refreshAll(ctx context.Context, ch chan<- []*TargetGroup) {
 	close(targetChan)
 }
 
-func (dd *Discovery) refresh(ctx context.Context, name string, isHTTPS bool, ch chan<- *TargetGroup) error {
+func (dd *Discovery) refresh(ctx context.Context, name string, isHTTPS bool, overridePort uint16, ch chan<- *TargetGroup) error {
 	// Discover all services on the network (e.g. _workstation._tcp)
 	resolver, err := zeroconf.NewResolver(nil)
 	if err != nil {
@@ -242,23 +245,27 @@ func (dd *Discovery) refresh(ctx context.Context, name string, isHTTPS bool, ch 
 				tg.Labels[parts[0]] = parts[1]
 			}
 
-			// Figure out an address
-			for _, v := range response.AddrIPv4 {
+			addTargetFunc := func(v net.IP) {
 				ip, ok := netip.AddrFromSlice(v)
 				if !ok {
-					continue
+					return
 				}
-				ipPort := netip.AddrPortFrom(ip, uint16(response.Port))
+
+				port := overridePort
+				if port == 0 {
+					port = uint16(response.Port)
+				}
+
+				ipPort := netip.AddrPortFrom(ip, port)
 				tg.Targets = append(tg.Targets, ipPort.String())
 			}
 
+			for _, v := range response.AddrIPv4 {
+				addTargetFunc(v)
+			}
+
 			for _, v := range response.AddrIPv6 {
-				ip, ok := netip.AddrFromSlice(v)
-				if !ok {
-					continue
-				}
-				ipPort := netip.AddrPortFrom(ip, uint16(response.Port))
-				tg.Targets = append(tg.Targets, ipPort.String())
+				addTargetFunc(v)
 			}
 
 			if len(tg.Targets) == 0 {
