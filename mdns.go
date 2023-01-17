@@ -20,8 +20,8 @@ import (
 	"flag"
 	"fmt"
 	"hash/fnv"
-	"io/ioutil"
 	"log"
+	"net/netip"
 	"sort"
 	"strings"
 	"sync"
@@ -29,7 +29,7 @@ import (
 
 	"github.com/prometheus/common/model"
 
-	"github.com/hashicorp/mdns"
+	"github.com/grandcat/zeroconf"
 	"github.com/natefinch/atomic"
 )
 
@@ -57,18 +57,35 @@ func (t TargetGroups) Less(i, j int) bool {
 	return strings.Compare(ti.Targets[0], tj.Targets[0]) == -1
 }
 
-var (
-	interval = flag.Duration("interval", 10*time.Second, "How often to query for services")
-	output   = flag.String("out", "-", "Filename to write output to")
-)
+type arrayFlags []string
 
-func init() {
-	// hashicorp/mdns outputs a lot of garbage on stdlog, so quiet it down...
-	log.SetOutput(ioutil.Discard)
+func (i *arrayFlags) String() string {
+	return strings.Join(*i, ", ")
 }
 
+func (i *arrayFlags) Set(value string) error {
+	*i = append(*i, value)
+	return nil
+}
+
+var (
+	interval     = flag.Duration("interval", 10*time.Second, "How often to query for services")
+	output       = flag.String("out", "-", "Filename to write output to")
+	httpDomains  arrayFlags
+	httpsDomains arrayFlags
+)
+
 func main() {
+	flag.Var(&httpDomains, "http-domain", "Domain to use for mDNS discovery for http endpoints. Can be used multiple times.")
+	flag.Var(&httpsDomains, "https-domain", "Domain to use for mDNS discovery for https endpoints. Can be used multiple times.")
 	flag.Parse()
+
+	// If no domains have been passed in via arguments, use the defaults
+	if len(httpDomains) == 0 && len(httpsDomains) == 0 {
+		httpDomains = append(httpDomains, "_prometheus-http._tcp")
+		httpsDomains = append(httpDomains, "_prometheus-https._tcp")
+	}
+
 	d := &Discovery{
 		interval: *interval,
 	}
@@ -141,11 +158,6 @@ func (dd *Discovery) Run(ctx context.Context, ch chan<- []*TargetGroup) {
 func (dd *Discovery) refreshAll(ctx context.Context, ch chan<- []*TargetGroup) {
 	var wg sync.WaitGroup
 
-	names := []string{
-		"_prometheus-http._tcp",
-		"_prometheus-https._tcp",
-	}
-
 	targetChan := make(chan *TargetGroup)
 	targets := make([]*TargetGroup, 0)
 
@@ -159,11 +171,21 @@ func (dd *Discovery) refreshAll(ctx context.Context, ch chan<- []*TargetGroup) {
 		ch <- targets
 	}()
 
-	wg.Add(len(names))
-	for _, name := range names {
+	wg.Add(len(httpDomains))
+	for _, name := range httpDomains {
 		go func(n string) {
-			if err := dd.refresh(ctx, n, targetChan); err != nil {
-				//log.Errorf("Error refreshing DNS targets: %s", err)
+			if err := dd.refresh(ctx, n, false, targetChan); err != nil {
+				log.Printf("Error refreshing DNS targets: %s", err)
+			}
+			wg.Done()
+		}(name)
+	}
+
+	wg.Add(len(httpsDomains))
+	for _, name := range httpsDomains {
+		go func(n string) {
+			if err := dd.refresh(ctx, n, true, targetChan); err != nil {
+				log.Printf("Error refreshing DNS targets: %s", err)
 			}
 			wg.Done()
 		}(name)
@@ -174,47 +196,35 @@ func (dd *Discovery) refreshAll(ctx context.Context, ch chan<- []*TargetGroup) {
 	close(targetChan)
 }
 
-// TODO: Re-do so we select over ctx.Done(), a mdns response, mdns being done or an error
-func (dd *Discovery) refresh(ctx context.Context, name string, ch chan<- *TargetGroup) error {
-	// Set up output channel and read discovered data
-	responses := make(chan *mdns.ServiceEntry, 100)
+func (dd *Discovery) refresh(ctx context.Context, name string, isHTTPS bool, ch chan<- *TargetGroup) error {
+	// Discover all services on the network (e.g. _workstation._tcp)
+	resolver, err := zeroconf.NewResolver(nil)
+	if err != nil {
+		return fmt.Errorf("failed to create resolver: %w", err)
+	}
 
-	// Do the actual lookup
-	go func() {
-		// TODO: Capture err somewhere
-		//err := mdns.Lookup(name, responses)
-		mdns.Lookup(name, responses)
-		close(responses)
-	}()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case response, chanOpen := <-responses:
-			if !chanOpen {
-				return nil
-			}
-
+	entries := make(chan *zeroconf.ServiceEntry)
+	go func(results <-chan *zeroconf.ServiceEntry) {
+		for response := range results {
 			// Make a new targetGroup with one address-label for each thing we scape
 			//
 			// Check https://github.com/prometheus/common/blob/master/model/labels.go for possible labels.
 			tg := &TargetGroup{
 				Labels: map[string]string{
-					model.InstanceLabel: strings.TrimRight(response.Host, "."),
+					model.InstanceLabel: strings.TrimRight(response.HostName, "."),
 					model.SchemeLabel:   "http",
 				},
-				Targets: []string{fmt.Sprintf("%s:%d", response.Host, response.Port)},
+				Targets: []string{},
 			}
 
 			// Set model.SchemeLabel to 'http' or 'https'
-			if strings.Contains(response.Name, "_prometheus-https._tcp") {
+			if isHTTPS {
 				tg.Labels[model.SchemeLabel] = "https"
 			}
 
 			// Parse InfoFields and set path as model.MetricsPathLabel if it's
 			// there.
-			for _, field := range response.InfoFields {
+			for _, field := range response.Text {
 				parts := strings.SplitN(field, "=", 2)
 
 				// If there is no key, set one
@@ -233,13 +243,40 @@ func (dd *Discovery) refresh(ctx context.Context, name string, ch chan<- *Target
 			}
 
 			// Figure out an address
-			if response.AddrV4 != nil {
-				tg.Targets[0] = fmt.Sprintf("%s:%d", response.AddrV4, response.Port)
-			} else if response.AddrV6 != nil {
-				tg.Targets[0] = fmt.Sprintf("[%s]:%d", response.AddrV6, response.Port)
+			for _, v := range response.AddrIPv4 {
+				ip, ok := netip.AddrFromSlice(v)
+				if !ok {
+					continue
+				}
+				ipPort := netip.AddrPortFrom(ip, uint16(response.Port))
+				tg.Targets = append(tg.Targets, ipPort.String())
+			}
+
+			for _, v := range response.AddrIPv6 {
+				ip, ok := netip.AddrFromSlice(v)
+				if !ok {
+					continue
+				}
+				ipPort := netip.AddrPortFrom(ip, uint16(response.Port))
+				tg.Targets = append(tg.Targets, ipPort.String())
+			}
+
+			if len(tg.Targets) == 0 {
+				continue
 			}
 
 			ch <- tg
 		}
+	}(entries)
+
+	ctx, cancel := context.WithTimeout(ctx, time.Second*2)
+	defer cancel()
+	err = resolver.Browse(ctx, name, "local.", entries)
+	if err != nil {
+		return fmt.Errorf("failed to browse: %w", err)
 	}
+
+	<-ctx.Done()
+
+	return nil
 }
